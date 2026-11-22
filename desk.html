@@ -1,0 +1,160 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Director room · Hybrid OBS</title><link rel="stylesheet" href="/studio.css">
+<header><div class="wrap"><span class="brand" aria-hidden="true">◧</span>Hybrid OBS<span class="role">Director console</span></div></header>
+<main class="director"><h1>Director room</h1><p class="lead">Monitor venue feeds and invite contributors.</p>
+<div class="tiles">
+<button class="tile" data-kind="local"><span class="glyph" aria-hidden="true">◉</span><span class="plus" aria-hidden="true">+</span><strong>Phone camera</strong><small>Join over Wi-Fi with a QR code</small></button>
+<button class="tile" data-kind="screen"><span class="glyph" aria-hidden="true">▣</span><span class="plus" aria-hidden="true">+</span><strong>Laptop screen</strong><small>Share a display, window or tab</small></button>
+<button class="tile" data-kind="remote"><span class="glyph" aria-hidden="true">↗</span><span class="plus" aria-hidden="true">+</span><strong>Remote guest</strong><small>Invite someone through VDO.Ninja</small></button></div>
+<section class="sources"><div class="sectionHead"><div><h2>Multiview</h2><small id="count"></small></div><label>Show <select id="filter"><option value="all">All sources</option><option value="local">Phone cameras</option><option value="screen">Laptop screens</option><option value="remote">Remote guests</option></select></label></div><div id="list" class="wall"></div><p id="noMatch" hidden>No sources match this filter.</p></section><p class="notice" id="notice" role="status"></p></main>
+<dialog id="add" aria-labelledby="addTitle"><form><h2 id="addTitle"></h2><label for="name">Source name</label><input id="name" maxlength="64" required autocomplete="off"><div class="actions"><button type="submit" class="primary">Create source</button><button type="button" data-close>Cancel</button></div><p id="error" role="alert"></p></form></dialog>
+<dialog id="scan" aria-labelledby="qrTitle"><h2 id="qrTitle"></h2><p>Scan with the camera phone on the venue Wi-Fi.</p><img id="qr" alt="Camera join QR code"><button data-close>Close</button></dialog>
+<script src="/director-preview.js"></script>
+<script>
+const get=id=>document.getElementById(id);
+const types={local:['Phone camera','Wide shot'],screen:['Laptop screen','Presentation'],remote:['Remote guest','Guest speaker']};
+const cards=new Map();
+let kind;
+for(const tile of document.querySelectorAll('.tile'))tile.onclick=()=>{
+ kind=tile.dataset.kind;get('addTitle').textContent='Add '+types[kind][0].toLowerCase();
+ get('error').textContent='';get('name').value='';get('name').placeholder=types[kind][1];
+ get('add').showModal();get('name').focus();
+};
+for(const button of document.querySelectorAll('[data-close]'))button.onclick=()=>button.closest('dialog').close();
+function element(tag,parent,txt,cls){
+ const el=document.createElement(tag);el.textContent=txt;if(cls)el.className=cls;parent.append(el);return el;
+}
+function makeCard(slot){
+ const row=element('article',get('list'),'','monitor');
+ row.dataset.kind=slot.kind;
+ const stage=element('div',row,'','monitorStage');
+ const image=element('img',stage,'');image.alt='Preview of '+slot.name;image.hidden=true;
+ const standby=element('span',stage,slot.kind==='remote'?'Online guest':'Waiting for device','standby');
+ const focus=element('button',stage,'Enlarge','focus');
+ focus.setAttribute('aria-label','Toggle enlarged preview for '+slot.name);focus.setAttribute('aria-expanded','false');
+ focus.onclick=()=>{
+  const enlarge=!row.classList.contains('enlarged');
+  for(const el of document.querySelectorAll('.enlarged')){
+   el.classList.remove('enlarged');el.querySelector('.focus').textContent='Enlarge';
+   el.querySelector('.focus').setAttribute('aria-expanded','false');
+  }
+  row.classList.toggle('enlarged',enlarge);focus.textContent=enlarge?'Reduce':'Enlarge';
+  focus.setAttribute('aria-expanded',String(enlarge));if(enlarge)row.scrollIntoView({block:'nearest'});
+ };
+ const identity=element('div',row,'','identity');element('h3',identity,slot.name);
+ const state=element('p',identity,'','state');
+ const actions=element('div',row,'','actions');
+ const previewButton=element('button',actions,slot.kind==='remote'?'Preview guest':'Live preview');
+ previewButton.onclick=()=>toggleDirectorPreview(slot,stage,previewButton);
+ const health=element('p',identity,'','health');
+ const meter=element('meter',identity,'');meter.min=0;meter.max=1;meter.hidden=true;
+ meter.setAttribute('aria-label','Device audio level');
+ const tally=element('strong',identity,'','sourceTally');
+ async function edit(change){
+  try{
+   const r=await fetch('/slots/edit',{method:'POST',body:JSON.stringify({id:slot.id,...change})});
+   if(!r.ok)throw Error(await r.json());await refresh();
+  }catch(error){get('notice').textContent=error.message}
+ }
+ element('button',actions,'Rename').onclick=()=>{
+  const name=prompt('Source name',slot.name)?.trim();
+  if(name && name!==slot.name)edit({name});
+ };
+ function move(offset){
+  const order=Array.from(get('list').children).filter(el=>el.dataset.id).sort((a,b)=>Number(a.dataset.position)-Number(b.dataset.position)).map(el=>el.dataset.id);
+  const index=order.indexOf(slot.id);
+  edit({before:offset<0?order[index-1]:order[index+2]||null});
+ }
+ const up=element('button',actions,'Move up');up.onclick=()=>move(-1);
+ const down=element('button',actions,'Move down');down.onclick=()=>move(1);
+ row.dataset.id=slot.id;
+ if(slot.kind==='local')element('button',actions,'Show QR').onclick=()=>{
+  get('qrTitle').textContent=slot.name;get('qr').src='/qr?id='+slot.links[0].split('#')[1];get('scan').showModal();
+ };
+ for(const [i,url] of slot.links.entries())element('button',actions,i?'Copy OBS URL':'Copy join link',i?'primary':'').onclick=async()=>{
+  try{await navigator.clipboard.writeText(url);get('notice').textContent=(i?'OBS URL':'Join link')+' copied for '+slot.name+'.'}
+  catch{prompt('Copy this link',url)}
+ };
+ const remove=element('button',actions,'Remove','removeSource');
+ remove.setAttribute('aria-label','Remove '+slot.name);
+ remove.onclick=async()=>{
+  const effect=slot.kind==='remote'?'This closes its director preview. The external guest link can still be used.':'This disconnects its local feed and disables its join and viewer links.';
+  if(!confirm('Remove “'+slot.name+'” from the Director room? '+effect))return;
+  remove.disabled=true;
+  try{
+   const response=await fetch('/slots/remove',{method:'POST',body:JSON.stringify({id:slot.id})});
+   if(!response.ok)throw Error(await response.json());
+   get('notice').textContent='Removed '+slot.name+'.';await refresh();
+  }catch(error){get('notice').textContent='Removal failed: '+error.message}
+  finally{remove.disabled=false}
+ };
+ return {row,state,image,standby,health,meter,tally,up,down,slot,focus,remove};
+}
+let revision=0;
+async function render(){
+ const request=++revision;
+ const response=await fetch('/slots');if(!response.ok)throw Error('Unable to load sources.');
+ const slots=await response.json();const list=get('list');
+ if(request!==revision)return;
+ const current=new Set(slots.map(slot=>slot.id));
+ for(const [id,card] of cards){
+  if(!current.has(id)){if(selectedPreview?.id===id)stopDirectorPreview();card.row.remove();cards.delete(id)}
+ }
+ get('count').textContent=slots.length+' '+(slots.length===1?'source':'sources');
+ if(!slots.length&&!get('empty')){
+  const empty=element('div',list,'','empty');empty.id='empty';element('strong',empty,'No sources yet');element('p',empty,'Choose a device above to create its join link.');
+ }
+ if(slots.length)get('empty')?.remove();
+ for(const [index,slot] of slots.entries()){
+  const id=slot.id;if(!cards.has(id))cards.set(id,makeCard(slot));
+  const card=cards.get(id);
+  const {state,image,standby,health,meter,tally}=card;
+  card.slot.name=slot.name;card.row.querySelector('h3').textContent=slot.name;
+  card.focus.setAttribute('aria-label','Toggle enlarged preview for '+slot.name);
+  card.remove.setAttribute('aria-label','Remove '+slot.name);image.alt='Preview of '+slot.name;
+  card.row.style.order=index;
+  card.row.dataset.position=index;
+  card.up.disabled=index===0;card.down.disabled=index===slots.length-1;
+  if(slot.kind!=='remote'){
+   if(slot.thumbnail && image.getAttribute('src')!==slot.thumbnail)image.src=slot.thumbnail;
+   image.hidden=!slot.thumbnail;standby.hidden=!!slot.thumbnail;
+   if(!slot.thumbnail){image.removeAttribute('src');standby.textContent=slot.active?'Awaiting preview':'Waiting for device'}
+  }
+  const age=t=>Math.max(0,Math.round((Date.now()-t)/1000))+'s';
+  if(slot.kind!=='remote'){
+   const h=slot.health||{};
+   const details=[];
+   if(slot.lastSeen)details.push('Last seen '+age(slot.lastSeen)+' ago');
+   if(slot.active && h.width && h.height)details.push(h.width+' × '+h.height);
+   if(slot.previewAt)details.push((slot.thumbnail?'Preview ':'Stale preview ')+age(slot.previewAt));
+   if(slot.active && h.audio)details.push('Device audio '+h.audio);
+   meter.hidden=!(slot.active && Number.isFinite(h.level));
+   if(!meter.hidden)meter.value=Math.min(1,Math.sqrt(h.level));
+   health.textContent=details.join(' · ');
+   tally.textContent=slot.onAir===true?'ON AIR':slot.onAir===false?'Standby':'Tally unavailable';
+   tally.classList.toggle('onAir',slot.onAir===true);
+  }
+  const label=slot.kind==='remote'?'Check in OBS':slot.active?(slot.received?'Viewer receiving video':slot.connected?'Viewer connected · checking video':'Device ready · waiting for viewer'):slot.lastSeen?'Device disconnected':'Waiting for device';
+  state.textContent=types[slot.kind][0]+' · '+label;state.classList.toggle('online',slot.kind!=='remote'&&slot.active);
+ }
+ applyFilter();
+}
+function applyFilter(){
+ const kind=get('filter').value;
+ let visible=0;
+ for(const {row} of cards.values()){
+  row.hidden=kind!=='all' && row.dataset.kind!==kind;
+  if(!row.hidden)visible++;
+ }
+ get('noMatch').hidden=cards.size===0 || visible>0;
+}
+get('filter').onchange=applyFilter;
+document.querySelector('form').onsubmit=async event=>{
+ event.preventDefault();const submit=event.target.querySelector('[type=submit]');submit.disabled=true;
+ try{
+  const r=await fetch('/slots',{method:'POST',body:JSON.stringify({kind,name:get('name').value})});
+  if(!r.ok)throw Error(await r.json());get('add').close();await refresh();
+ }catch(e){get('error').textContent=e.message}finally{submit.disabled=false}
+};
+async function refresh(){try{await render();if(get('notice').dataset.failed){get('notice').textContent='';delete get('notice').dataset.failed}}catch{get('notice').dataset.failed='1';get('notice').textContent='Dashboard disconnected. Reconnecting…'}}
+refresh();setInterval(refresh,3000);
+</script></html>

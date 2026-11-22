@@ -1,0 +1,6 @@
+*.pem
+*.key
+.studio-certs/
+slots.json
+slots.tmp
+node_modules/

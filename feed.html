@@ -1,0 +1,165 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Local camera</title>
+<link rel="stylesheet" href="/studio.css">
+<header><div class="wrap"><span class="brand" aria-hidden="true">◧</span>Hybrid OBS<span class="role">Device setup</span></div></header>
+<main class="device"><div class="operator"><h1>Phone camera</h1><strong id="tally">Tally unavailable</strong><p id="status" role="status">Choose a lens and go live.</p></div>
+<div class="preview"><video autoplay playsinline></video><span id="placeholder">Device preview</span></div>
+<div class="controls operator"><label>Lens <select><option value="environment">Rear</option><option value="user">Front</option></select></label><label id="qualityLabel">Quality <select id="quality"><option>480</option><option selected>720</option><option>1080</option></select>p</label><button class="primary" id="start">Go live</button><button id="mute" disabled>Unmute microphone</button></div></main>
+<script>
+const screenShare=location.pathname==='/screen';
+const camera=screenShare || location.pathname==='/camera', video=document.querySelector('video'),statusLine=document.querySelector('#status');
+const start=document.querySelector('#start'),lens=document.querySelector('select'),mute=document.querySelector('#mute');
+let stream,pc,current,applied=false,running=false,stalled=0;
+const token=location.hash.slice(1);
+const thumbnailCanvas=document.createElement('canvas');
+let lastThumbnail=0;
+function directorThumbnail(action){
+ if(!camera || action!=='poll' || !video.videoWidth || Date.now()-lastThumbnail<2200)return;
+ lastThumbnail=Date.now();
+ const scale=Math.min(384/video.videoWidth,216/video.videoHeight,1);
+ thumbnailCanvas.width=Math.max(1,Math.round(video.videoWidth*scale));
+ thumbnailCanvas.height=Math.max(1,Math.round(video.videoHeight*scale));
+ try{
+  const context=thumbnailCanvas.getContext('2d');
+  context.drawImage(video,0,0,thumbnailCanvas.width,thumbnailCanvas.height);
+  const jpeg=thumbnailCanvas.toDataURL('image/jpeg',0.55);
+  if(jpeg.length<80000)return jpeg;
+ }catch{ /* Preview capture is optional for the OBS connection. */ }
+}
+let onAir=null, analyzer, samples, audioContext, monitorPeer, monitorId;
+let previousTime=-1;
+window.addEventListener('obsSourceActiveChanged',event=>{
+ if(!camera && window.obsstudio && typeof event.detail?.active==='boolean')onAir=event.detail.active;
+});
+function qualityConstraints(){
+ const height=Number(document.querySelector('#quality').value);
+ return {width:{ideal:Math.round(height*16/9)},height:{ideal:height},frameRate:{ideal:30}};
+}
+function healthReport(){
+ const track=stream?.getAudioTracks()[0];
+ let level=null;
+ if(track?.enabled && analyzer && audioContext.state==='running'){
+  analyzer.getFloatTimeDomainData(samples);
+  let sum=0;for(const sample of samples)sum+=sample*sample;
+  level=Math.sqrt(sum/samples.length);
+ }
+ return {width:video.videoWidth,height:video.videoHeight,level,
+  audio:!track?'unavailable':track.enabled?'enabled':'muted'};
+}
+function closeMonitor(){
+ if(monitorPeer)monitorPeer.close();
+ monitorPeer=null;monitorId=null;
+}
+async function answerMonitor(preview){
+ if(!preview){closeMonitor();return}
+ if(preview.id===monitorId)return;
+ closeMonitor();
+ const peer=new RTCPeerConnection({iceServers:[]});
+ monitorPeer=peer;monitorId=preview.id;
+ try{
+  peer.addTrack(stream.getVideoTracks()[0],stream);
+  await peer.setRemoteDescription({type:'offer',sdp:preview.offer});
+  const sdp=await describe(peer,await peer.createAnswer());
+  if(peer!==monitorPeer)return;
+  const result=await fetch('/signal',{method:'POST',body:JSON.stringify({action:'previewAnswer',token,lease:preview.id,sdp}),signal:AbortSignal.timeout(8000)});
+  if(!result.ok)throw Error();
+ }catch{if(peer===monitorPeer)closeMonitor()}
+}
+function renderTally(value){
+ const el=document.querySelector('#tally');
+ el.textContent=value===true?'ON AIR':value===false?'Standby':'Tally unavailable';
+ el.classList.toggle('onAir',value===true);
+}
+async function signal(action,sdp){
+ const frames=video.getVideoPlaybackQuality?.().totalVideoFrames;
+ const received=!camera && video.readyState>=2 && Number.isFinite(frames) && frames>0 && frames>previousTime;
+ previousTime=frames;
+ const r=await fetch('/signal',{method:'POST',body:JSON.stringify({action,token,received,onAir,health:camera?healthReport():undefined,generation:current,sdp,thumbnail:directorThumbnail(action),connected:pc?.connectionState==='connected'}),signal:AbortSignal.timeout(8000)});
+ if(r.status===403){
+  running=false;closeMonitor();
+  stream?.getTracks().forEach(track=>track.stop());
+  video.srcObject=null;start.disabled=true;mute.disabled=true;
+  throw Error('This source link is no longer available.');
+ }
+ if(!r.ok)throw Error('Signaling interrupted');return r.json()
+}
+function clearPeer(){if(pc)pc.close();pc=null;applied=false;stalled=0;if(!camera)video.srcObject=null}
+async function describe(peer,description){
+ await peer.setLocalDescription(description);
+ if(peer.iceGatheringState!=='complete')await new Promise(resolve=>{
+  let t;function done(){clearTimeout(t);peer.removeEventListener('icegatheringstatechange',check);resolve()}
+  function check(){if(peer.iceGatheringState==='complete')done()}
+  t=setTimeout(done,5000);peer.addEventListener('icegatheringstatechange',check);check()
+ });
+ return peer.localDescription.sdp
+}
+function newPeer(){
+ pc=new RTCPeerConnection({iceServers:[]});
+ if(camera)for(const track of stream.getTracks())pc.addTrack(track,stream);
+ else{
+  pc.ontrack=e=>{video.srcObject=e.streams[0];video.play().catch(()=>{})};
+  for(const kind of ['video','audio'])pc.addTransceiver(kind,{direction:'recvonly'});
+ }
+ return pc
+}
+async function loop(){
+ let reset=true;
+ while(running){
+  try{
+   const state=await signal(reset?'reset':'poll');reset=false;
+   if(camera){renderTally(state.onAir);void answerMonitor(state.preview)}
+   if(state.generation!==current){clearPeer();current=state.generation}
+   if(!camera&&!pc){
+    const peer=newPeer();await signal('write',await describe(peer,await peer.createOffer()))
+   }else if(camera&&state.sdp&&!pc){
+    const peer=newPeer();await peer.setRemoteDescription({type:'offer',sdp:state.sdp});
+    await signal('write',await describe(peer,await peer.createAnswer()))
+   }else if(!camera&&pc&&state.sdp&&!applied){
+    await pc.setRemoteDescription({type:'answer',sdp:state.sdp});applied=true
+   }
+   if(pc?.connectionState==='failed'||pc?.connectionState==='disconnected')stalled++;else stalled=0;
+   if(stalled>=4)reset=true;
+   if(camera)statusLine.textContent=pc?.connectionState==='connected'?'Connected to OBS':(screenShare?'Screen ready · waiting for OBS':'Camera ready · waiting for OBS');
+  }catch(e){clearPeer();closeMonitor();renderTally(null);reset=true;statusLine.textContent=running?'Connection interrupted · reconnecting':e.message}
+  await new Promise(r=>setTimeout(r,1000))
+ }
+}
+if(camera){
+ video.muted=true;
+ const quality=document.querySelector('#quality');let lastQuality=quality.value;
+ quality.onchange=async()=>{if(!stream)return;quality.disabled=true;try{await stream.getVideoTracks()[0].applyConstraints(qualityConstraints());lastQuality=quality.value}catch{quality.value=lastQuality;alert('This camera could not apply that quality.')}finally{quality.disabled=false}};
+ if(screenShare){
+  document.querySelector('#qualityLabel').hidden=true;
+  document.title='Laptop screen';
+  document.querySelector('h1').textContent='Laptop screen';
+  lens.parentElement.hidden=true;
+  start.textContent='Share screen';
+  statusLine.textContent='Choose the display, window or tab to send to OBS.';
+  mute.textContent='Enable shared audio';
+ }
+ start.onclick=async()=>{
+  start.disabled=true;
+  try{
+   const v={facingMode:{ideal:lens.value},...qualityConstraints()};
+   if(screenShare){
+    if(!navigator.mediaDevices?.getDisplayMedia)throw Error('Open this trusted HTTPS link in a desktop browser that supports screen sharing.');
+    stream=await navigator.mediaDevices.getDisplayMedia({video:{frameRate:{ideal:30}},audio:true});
+    stream.getVideoTracks()[0].addEventListener('ended',()=>location.reload(),{once:true});
+   }else try{stream=await navigator.mediaDevices.getUserMedia({video:v,audio:true})}
+   catch{stream=await navigator.mediaDevices.getUserMedia({video:v,audio:false})}
+   lastQuality=quality.value;
+   for(const t of stream.getAudioTracks())t.enabled=false;
+   if(stream.getAudioTracks().length){
+    try{
+     audioContext=new AudioContext();analyzer=audioContext.createAnalyser();
+     analyzer.fftSize=512;samples=new Float32Array(analyzer.fftSize);
+     audioContext.createMediaStreamSource(stream).connect(analyzer);
+    }catch{analyzer=null}
+   }
+   document.querySelector("#placeholder").hidden=true;video.srcObject=stream;lens.disabled=true;mute.disabled=!stream.getAudioTracks().length;
+   start.textContent=screenShare?'Stop sharing':'Stop camera';start.disabled=false;start.onclick=()=>{stream.getTracks().forEach(t=>t.stop());location.reload()};
+   running=true;loop()
+  }catch(e){start.disabled=false;statusLine.textContent=e.message}
+ };
+ mute.onclick=()=>{audioContext?.resume().catch(()=>{});const t=stream.getAudioTracks()[0];t.enabled=!t.enabled;mute.textContent=screenShare?(t.enabled?'Mute shared audio':'Enable shared audio'):(t.enabled?'Mute microphone':'Unmute microphone')};
+}else{document.body.className='view';running=true;loop()}
+</script></html>
